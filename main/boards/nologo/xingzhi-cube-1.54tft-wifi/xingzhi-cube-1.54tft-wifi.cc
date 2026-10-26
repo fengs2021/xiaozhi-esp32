@@ -18,6 +18,47 @@
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
 
+// 基类 SetPowerSaveMode 只清聊天文本、改表情，并不会真的关掉面板。
+// 这里补上 disp_on_off，让未唤醒时屏幕真正熄灭（省电、防烧屏）。
+class PowerSavingSpiLcdDisplay : public SpiLcdDisplay {
+public:
+    using SpiLcdDisplay::SpiLcdDisplay;
+
+    void SetPowerSaveMode(bool on) override {
+        if (!on) {
+            SetPanelPower(true);
+        }
+
+        SpiLcdDisplay::SetPowerSaveMode(on);
+
+        if (on) {
+            SetPanelPower(false);
+        }
+    }
+
+private:
+    bool panel_powered_on_ = true;
+
+    void SetPanelPower(bool on) {
+        if (panel_powered_on_ == on) {
+            return;
+        }
+
+        esp_err_t err = esp_lcd_panel_disp_on_off(panel_, on);
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGW(TAG, "Panel does not support disp_on_off");
+            panel_powered_on_ = on;
+            return;
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to %s display panel: %s", on ? "turn on" : "turn off", esp_err_to_name(err));
+            return;
+        }
+
+        panel_powered_on_ = on;
+    }
+};
+
 class XINGZHI_CUBE_1_54TFT_WIFI : public WifiBoard {
 private:
     Button boot_button_;
@@ -45,22 +86,16 @@ private:
         rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_OUTPUT_ONLY);
         rtc_gpio_set_level(GPIO_NUM_21, 1);
 
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // 10 秒未唤醒就真关屏（PR #2033 的做法），不深睡、不断连，
+        // 这样 MQTT 长连接一直在，服务端随时能推送（定时任务/主动播报）。
+        power_save_timer_ = new PowerSaveTimer(-1, 10, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(1);
+            GetBacklight()->SetBrightness(0);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
-        });
-        power_save_timer_->OnShutdownRequest([this]() {
-            ESP_LOGI(TAG, "Shutting down");
-            rtc_gpio_set_level(GPIO_NUM_21, 0);
-            // 启用保持功能，确保睡眠期间电平不变
-            rtc_gpio_hold_en(GPIO_NUM_21);
-            esp_lcd_panel_disp_on_off(panel_, false); //关闭显示
-            esp_deep_sleep_start();
         });
         power_save_timer_->SetEnabled(true);
     }
@@ -146,7 +181,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_, true));
 
-        display_ = new SpiLcdDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, 
+        display_ = new PowerSavingSpiLcdDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, 
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
