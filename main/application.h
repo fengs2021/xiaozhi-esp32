@@ -11,6 +11,7 @@
 #include <deque>
 #include <memory>
 #include <functional>
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -152,10 +153,14 @@ private:
     bool startup_completed_ = false;
     bool pending_startup_wake_word_hint_ = false;
     bool aborted_ = false;
+    // 发起打断的时刻；非零值表示还在等服务端 tts stop（CLOCK_TICK 里做看门狗）
+    std::chrono::steady_clock::time_point abort_pending_since_{};
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
+    // listening 状态下连续多少秒既没检测到人声、也没收到服务端消息（CLOCK_TICK 里累加）
+    int listening_idle_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
 

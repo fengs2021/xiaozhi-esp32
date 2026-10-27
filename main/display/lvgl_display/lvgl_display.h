@@ -32,6 +32,14 @@ public:
     virtual void ClearTextGlyphs() override;
     virtual bool SetTextFont(std::shared_ptr<LvglFont> text_font) override;
     virtual bool SupportsGuiOperations() const override { return true; }
+    virtual void ShowCountdown(int seconds, const char* text) override;
+    virtual void HideCountdown() override;
+    virtual bool IsCountdownVisible() const override { return countdown_visible_; }
+    virtual void ShowMusic(const char* title, const char* artist, int duration_seconds,
+                           int position_seconds, bool paused, const char* mode = nullptr) override;
+    virtual void UpdateMusic(int position_seconds, int duration_seconds, bool paused) override;
+    virtual void HideMusic() override;
+    virtual bool IsMusicVisible() const override { return music_visible_; }
 
 protected:
     esp_pm_lock_handle_t pm_lock_ = nullptr;
@@ -53,6 +61,37 @@ protected:
     esp_timer_handle_t notification_timer_ = nullptr;
     int last_displayed_clock_min_ = -1;   // -1 forces update on first idle tick
     std::unique_ptr<DynamicGlyphCache> dynamic_glyph_cache_;
+
+    // 倒计时叠加层：全屏容器盖在最上层，表情和聊天气泡都在它下面，互不干扰。
+    lv_obj_t* countdown_container_ = nullptr;
+    lv_obj_t* countdown_num_label_ = nullptr;
+    lv_obj_t* countdown_hint_label_ = nullptr;
+    int countdown_remaining_ = 0;
+    bool countdown_visible_ = false;  // 真正在显示吗；容器指针非空不代表看得见
+    esp_timer_handle_t countdown_timer_ = nullptr;
+    void CountdownTick();
+    void UpdateCountdownLabel();
+
+    // 音乐叠加层：5 根跳动的柱子 + 歌名/歌手 + 进度条 + 时间。
+    lv_obj_t* music_container_ = nullptr;
+    lv_obj_t* music_bars_row_ = nullptr;
+    lv_obj_t* music_bars_[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    lv_obj_t* music_title_label_ = nullptr;
+    lv_obj_t* music_artist_label_ = nullptr;
+    lv_obj_t* music_progress_ = nullptr;
+    lv_obj_t* music_time_label_ = nullptr;
+    lv_obj_t* music_pause_label_ = nullptr;
+    int music_position_ = 0;
+    int music_duration_ = 0;
+    bool music_paused_ = false;
+    bool music_visible_ = false;
+    // 歌手行右侧拼上播放模式（"儿歌多多 · 单曲循环"），省一块地方
+    std::string music_artist_text_;
+    std::string music_mode_text_;
+    int music_tick_ = 0;
+    esp_timer_handle_t music_timer_ = nullptr;
+    void MusicTick();
+    void UpdateMusicLabels();
 
     friend class DisplayLockGuard;
     virtual bool Lock(int timeout_ms = 0) = 0;

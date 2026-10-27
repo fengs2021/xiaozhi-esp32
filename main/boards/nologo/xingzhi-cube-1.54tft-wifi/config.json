@@ -1,11 +1,21 @@
 {
-    "manufacturer": "nologo",
-    "type": "xingzhi-cube-1.54tft-wifi",
-    "target": "esp32s3",
-    "builds": [
-        {
-            "name": "xingzhi-cube-1.54tft-wifi",
-            "sdkconfig_append": []
-        }
-    ]
+  "manufacturer": "nologo",
+  "type": "xingzhi-cube-1.54tft-wifi",
+  "target": "esp32s3",
+  "builds": [
+    {
+      "name": "xingzhi-cube-1.54tft-wifi",
+      "sdkconfig_append": [
+        "CONFIG_PM_ENABLE=y",
+        "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y",
+        "CONFIG_PM_SLP_IRAM_OPT=y",
+        "CONFIG_ESP_WIFI_SLP_IRAM_OPT=y",
+        "CONFIG_LV_FONT_MONTSERRAT_48=y",
+        "CONFIG_OTA_URL=\"http://YOUR_SERVER_IP:8003/xiaozhi/ota/\"",
+        "CONFIG_OTA_URL_FALLBACK=\"https://YOUR_DOMAIN/xiaozhi/ota/\"",
+        "CONFIG_DEFAULT_WIFI_SSID=\"YOUR_WIFI_SSID\"",
+        "CONFIG_DEFAULT_WIFI_PASSWORD=\"YOUR_WIFI_PASSWORD\""
+      ]
+    }
+  ]
 }

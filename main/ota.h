@@ -33,8 +33,14 @@ public:
     const std::string& GetActivationMessage() const { return activation_message_; }
     const std::string& GetActivationCode() const { return activation_code_; }
     std::string GetCheckVersionUrl();
+    // 返回按优先级排序的 OTA 地址列表：主地址在前，备用地址在后。
+    std::vector<std::string> GetCheckVersionUrlCandidates();
+    // 返回最近一次 CheckVersion 成功的地址，用于 Activate() 保持一致。
+    const std::string& GetActiveCheckVersionUrl() const { return active_ota_url_; }
 
 private:
+    NetworkResult<> CheckVersionOnce(const std::string& url);
+    std::string active_ota_url_;
     std::string activation_message_;
     std::string activation_code_;
     bool has_new_version_ = false;

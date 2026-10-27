@@ -62,6 +62,33 @@ public:
     virtual void SetupUI() { setup_ui_called_ = true; }
     virtual bool IsMonochrome() const { return false; }
     virtual bool SupportsGuiOperations() const { return false; }
+    // 倒计时叠加层：只盖屏幕，独立于表情和聊天气泡。音频链路（唤醒词、VAD、
+    // 对话）完全不受影响 —— 倒计时期间照样能叫醒、能插话，秒数继续走。
+    virtual void ShowCountdown(int seconds, const char* text) {
+        (void)seconds;
+        (void)text;
+    }
+    virtual void HideCountdown() {}
+    virtual bool IsCountdownVisible() const { return false; }
+    // 音乐播放叠加层：歌名、歌手、进度条、暂停态。纯展示，本板无触摸，
+    // 切歌暂停还是靠语音和网页控制；期间不改音频链路。
+    // mode 是给人看的模式名（"单曲循环" 等），可为 nullptr
+    virtual void ShowMusic(const char* title, const char* artist, int duration_seconds,
+                           int position_seconds, bool paused, const char* mode = nullptr) {
+        (void)title;
+        (void)artist;
+        (void)duration_seconds;
+        (void)position_seconds;
+        (void)paused;
+        (void)mode;
+    }
+    virtual void UpdateMusic(int position_seconds, int duration_seconds, bool paused) {
+        (void)position_seconds;
+        (void)duration_seconds;
+        (void)paused;
+    }
+    virtual void HideMusic() {}
+    virtual bool IsMusicVisible() const { return false; }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }
     virtual bool InsertAnimDialog(const char* name, uint32_t duration_ms) {
         (void)name;

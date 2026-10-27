@@ -7,20 +7,21 @@
 
 class PowerSaveTimer {
 public:
-    PowerSaveTimer(int cpu_max_freq, int seconds_to_sleep = 20, int seconds_to_shutdown = -1);
+    // seconds_to_sleep_audio：进入第二级省电（关唤醒词 + 关麦克风输入 + CPU light sleep）
+    // 所需的空闲秒数。-1 表示跟随 seconds_to_sleep，保持旧板子的行为不变。
+    // 拆成两级是因为「关屏幕」可以很快发生（省电又不打断使用），
+    // 而「关唤醒词」晚得多（关了就只能按键唤醒，不能太早）。
+    PowerSaveTimer(int cpu_max_freq, int seconds_to_sleep = 20, int seconds_to_shutdown = -1,
+                   int seconds_to_sleep_audio = -1);
     ~PowerSaveTimer();
 
-    // A disabled-to-enabled transition starts a fresh idle cycle. Re-enabling an
-    // already enabled timer leaves the current countdown and request unchanged.
     void SetEnabled(bool enabled);
     void OnEnterSleepMode(std::function<void()> callback);
     void OnExitSleepMode(std::function<void()> callback);
-    // Called at most once per idle cycle, on the esp_timer task. WakeUp(), a
-    // disabled-to-enabled transition, or activity resetting the countdown before
-    // sleep mode rearms the request. A callback that declines a request must own
-    // any retry or explicitly start a new idle cycle; returning does not retry.
+    // 第二级省电（关唤醒词 + 关麦克风 + light sleep）的回调，用来把屏幕彻底关掉。
+    void OnEnterAudioSleepMode(std::function<void()> callback);
+    void OnExitAudioSleepMode(std::function<void()> callback);
     void OnShutdownRequest(std::function<void()> callback);
-    // Reset the idle countdown and shutdown request, and exit sleep mode if active.
     void WakeUp();
 
 private:
@@ -29,14 +30,17 @@ private:
     esp_timer_handle_t power_save_timer_ = nullptr;
     bool enabled_ = false;
     bool in_sleep_mode_ = false;
+    bool in_audio_sleep_ = false;
     bool is_wake_word_running_ = false;
-    bool shutdown_requested_ = false;
     int ticks_ = 0;
     int cpu_max_freq_;
     int seconds_to_sleep_;
     int seconds_to_shutdown_;
+    int seconds_to_sleep_audio_;
 
     std::function<void()> on_enter_sleep_mode_;
     std::function<void()> on_exit_sleep_mode_;
+    std::function<void()> on_enter_audio_sleep_mode_;
+    std::function<void()> on_exit_audio_sleep_mode_;
     std::function<void()> on_shutdown_request_;
 };

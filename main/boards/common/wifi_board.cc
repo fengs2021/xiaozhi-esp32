@@ -99,6 +99,18 @@ void WifiBoard::StartNetwork() {
 
 void WifiBoard::TryWifiConnect() {
     auto& ssid_manager = SsidManager::GetInstance();
+
+    // Seed the credential list from the build-time defaults on first boot.
+    // Only runs when NVS holds no Wi-Fi credentials at all, so a user who
+    // provisions Wi-Fi later through the config AP is never overridden.
+    if (ssid_manager.GetSsidList().empty()) {
+        const char* default_ssid = CONFIG_DEFAULT_WIFI_SSID;
+        if (default_ssid != nullptr && default_ssid[0] != '\0') {
+            ESP_LOGI(TAG, "No saved Wi-Fi credentials, seeding default SSID: %s", default_ssid);
+            ssid_manager.AddSsid(default_ssid, CONFIG_DEFAULT_WIFI_PASSWORD);
+        }
+    }
+
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
     if (have_ssid) {

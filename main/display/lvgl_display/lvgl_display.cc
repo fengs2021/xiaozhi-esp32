@@ -308,6 +308,332 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
 
 void LvglDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {}
 
+// ---------- 倒计时叠加层 ----------
+// 全程只碰屏幕对象：不改音频状态、不动 VAD、不开关注唤醒词，所以倒计时期间
+// 设备照样能被叫醒、能正常对话，秒数在独立定时器里继续走。
+void LvglDisplay::UpdateCountdownLabel() {
+    if (countdown_num_label_ == nullptr) {
+        return;
+    }
+    int total = countdown_remaining_ > 0 ? countdown_remaining_ : 0;
+    int hours = total / 3600;
+    int minutes = (total % 3600) / 60;
+    int seconds = total % 60;
+    char buf[16];
+    if (hours > 0) {
+        snprintf(buf, sizeof(buf), "%d:%02d:%02d", hours, minutes, seconds);
+    } else {
+        snprintf(buf, sizeof(buf), "%02d:%02d", minutes, seconds);
+    }
+    lv_label_set_text(countdown_num_label_, buf);
+}
+
+void LvglDisplay::ShowCountdown(int seconds, const char* text) {
+    if (seconds <= 0) {
+        HideCountdown();
+        return;
+    }
+    DisplayLockGuard lock(this);
+    countdown_remaining_ = seconds;
+
+    if (countdown_container_ == nullptr) {
+        lv_obj_t* screen = lv_screen_active();
+        countdown_container_ = lv_obj_create(screen);
+        lv_obj_remove_style_all(countdown_container_);
+        lv_obj_set_size(countdown_container_, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_color(countdown_container_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(countdown_container_, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(countdown_container_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(countdown_container_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(countdown_container_, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        countdown_num_label_ = lv_label_create(countdown_container_);
+        lv_obj_set_style_text_color(countdown_num_label_, lv_color_white(), 0);
+        lv_obj_set_style_text_font(countdown_num_label_, &lv_font_montserrat_48, 0);
+
+        countdown_hint_label_ = lv_label_create(countdown_container_);
+        lv_obj_set_style_text_color(countdown_hint_label_, lv_color_hex(0x9A9A9A), 0);
+        lv_obj_set_style_text_font(countdown_hint_label_, &lv_font_montserrat_14, 0);
+    }
+
+    // 中文提示要服务端按需下发字形，倒计时的关键信息是秒数本身，这里只记日志。
+    if (text != nullptr && text[0] != '\0') {
+        ESP_LOGI(TAG, "Countdown for: %s", text);
+    }
+    lv_obj_move_foreground(countdown_container_);
+    lv_obj_remove_flag(countdown_container_, LV_OBJ_FLAG_HIDDEN);
+    countdown_visible_ = true;
+    UpdateCountdownLabel();
+
+    if (countdown_timer_ == nullptr) {
+        esp_timer_create_args_t timer_args = {};
+        timer_args.callback = [](void* arg) {
+            static_cast<LvglDisplay*>(arg)->CountdownTick();
+        };
+        timer_args.arg = this;
+        timer_args.name = "countdown";
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &countdown_timer_));
+    }
+    esp_timer_stop(countdown_timer_);
+    esp_timer_start_periodic(countdown_timer_, 1000000);
+    ESP_LOGI(TAG, "Countdown started: %d s", seconds);
+}
+
+void LvglDisplay::HideCountdown() {
+    if (countdown_timer_ != nullptr) {
+        esp_timer_stop(countdown_timer_);
+    }
+    countdown_remaining_ = 0;
+    countdown_visible_ = false;
+    if (countdown_container_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    lv_obj_add_flag(countdown_container_, LV_OBJ_FLAG_HIDDEN);
+    // 倒计时收起来以后，正在放歌的界面要重新回到最上层
+    if (music_visible_ && music_container_ != nullptr) {
+        lv_obj_move_foreground(music_container_);
+    }
+}
+
+void LvglDisplay::CountdownTick() {
+    if (countdown_remaining_ <= 0) {
+        return;
+    }
+    countdown_remaining_--;
+    bool finished = countdown_remaining_ <= 0;
+    {
+        DisplayLockGuard lock(this);
+        if (countdown_container_ != nullptr) {
+            if (finished) {
+                lv_obj_add_flag(countdown_container_, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                UpdateCountdownLabel();
+            }
+        }
+        if (finished) {
+            countdown_visible_ = false;
+        }
+    }
+    // 到点由服务端播报并下发 countdown_hide；这里只是兜底，别让屏上停住。
+    if (finished && countdown_timer_ != nullptr) {
+        esp_timer_stop(countdown_timer_);
+    }
+}
+
+// ---------- 音乐播放叠加层 ----------
+// 纯展示：这块 1.54 寸屏没有触摸，切歌/暂停仍然靠语音和网页控制。
+// 全程只碰屏幕对象，不改音频状态，唤醒词和对话链路照常工作。
+namespace {
+// 5 根柱子的跳动表：每 250ms 换一行，看起来像在打拍子（不引随机数，省 RAM）
+constexpr uint8_t kMusicBarPattern[8][5] = {
+    {26, 12, 20, 9, 23},  {15, 24, 10, 21, 12}, {9, 19, 26, 14, 17},
+    {21, 10, 15, 26, 9},  {12, 22, 9, 17, 24},  {24, 9, 21, 10, 15},
+    {10, 17, 13, 24, 20}, {19, 13, 24, 15, 10},
+};
+}  // namespace
+
+void LvglDisplay::UpdateMusicLabels() {
+    if (music_time_label_ == nullptr) {
+        return;
+    }
+    int pos = music_position_ > 0 ? music_position_ : 0;
+    int dur = music_duration_ > 0 ? music_duration_ : 0;
+    if (dur > 0 && pos > dur) {
+        pos = dur;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d:%02d / %d:%02d", pos / 60, pos % 60, dur / 60, dur % 60);
+    lv_label_set_text(music_time_label_, buf);
+    if (music_artist_label_ != nullptr) {
+        std::string line = music_artist_text_;
+        if (!music_mode_text_.empty()) {
+            line += line.empty() ? music_mode_text_ : " · " + music_mode_text_;
+        }
+        lv_label_set_text(music_artist_label_, line.c_str());
+    }
+    if (music_progress_ != nullptr && dur > 0) {
+        lv_bar_set_range(music_progress_, 0, dur);
+        lv_bar_set_value(music_progress_, pos, LV_ANIM_OFF);
+    }
+    if (music_pause_label_ != nullptr) {
+        if (music_paused_) {
+            lv_obj_remove_flag(music_pause_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(music_pause_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void LvglDisplay::ShowMusic(const char* title, const char* artist, int duration_seconds,
+                            int position_seconds, bool paused, const char* mode) {
+    DisplayLockGuard lock(this);
+    music_duration_ = duration_seconds > 0 ? duration_seconds : 0;
+    music_position_ = position_seconds > 0 ? position_seconds : 0;
+    music_paused_ = paused;
+    music_artist_text_ = artist != nullptr ? artist : "";
+    // mode 为空时保留上一次的模式名（切歌不会带空串，这里只是防御）
+    if (mode != nullptr) {
+        music_mode_text_ = mode;
+    }
+
+    if (music_container_ == nullptr) {
+        // 歌名和歌手是中文，得用主题里的 CBin 字体（聊天字幕用的就是它）
+        const lv_font_t* text_font = &lv_font_montserrat_14;
+        if (current_theme_ != nullptr) {
+            auto theme_font = current_theme_->GetTextFont();
+            if (theme_font != nullptr && theme_font->font() != nullptr) {
+                text_font = theme_font->font();
+            }
+        }
+
+        lv_obj_t* screen = lv_screen_active();
+        music_container_ = lv_obj_create(screen);
+        lv_obj_remove_style_all(music_container_);
+        lv_obj_set_size(music_container_, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_color(music_container_, lv_color_hex(0x101519), 0);
+        lv_obj_set_style_bg_opa(music_container_, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(music_container_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(music_container_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(music_container_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(music_container_, 8, 0);
+
+        music_bars_row_ = lv_obj_create(music_container_);
+        lv_obj_remove_style_all(music_bars_row_);
+        lv_obj_set_size(music_bars_row_, 120, 32);
+        lv_obj_remove_flag(music_bars_row_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(music_bars_row_, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(music_bars_row_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(music_bars_row_, 6, 0);
+        for (int i = 0; i < 5; ++i) {
+            music_bars_[i] = lv_obj_create(music_bars_row_);
+            lv_obj_remove_style_all(music_bars_[i]);
+            lv_obj_set_width(music_bars_[i], 8);
+            lv_obj_set_height(music_bars_[i], kMusicBarPattern[0][i]);
+            lv_obj_set_style_bg_color(music_bars_[i], lv_color_hex(0x4DD0E1), 0);
+            lv_obj_set_style_bg_opa(music_bars_[i], LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(music_bars_[i], 4, 0);
+        }
+
+        music_title_label_ = lv_label_create(music_container_);
+        lv_obj_set_width(music_title_label_, 200);
+        lv_obj_set_style_text_align(music_title_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(music_title_label_, lv_color_white(), 0);
+        lv_obj_set_style_text_font(music_title_label_, text_font, 0);
+        // 长歌名不打折行：走马灯滚一圈，屏太小，折行会把进度条挤出屏
+        lv_label_set_long_mode(music_title_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+        music_artist_label_ = lv_label_create(music_container_);
+        lv_obj_set_width(music_artist_label_, 200);
+        lv_obj_set_style_text_align(music_artist_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(music_artist_label_, lv_color_hex(0x9AA4AE), 0);
+        lv_obj_set_style_text_font(music_artist_label_, text_font, 0);
+        lv_label_set_long_mode(music_artist_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+        music_progress_ = lv_bar_create(music_container_);
+        lv_obj_set_size(music_progress_, 200, 6);
+        lv_bar_set_range(music_progress_, 0, 100);
+        lv_bar_set_value(music_progress_, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(music_progress_, lv_color_hex(0x2A3138), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(music_progress_, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(music_progress_, 3, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(music_progress_, lv_color_hex(0x4DD0E1), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(music_progress_, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(music_progress_, 3, LV_PART_INDICATOR);
+
+        music_time_label_ = lv_label_create(music_container_);
+        lv_obj_set_style_text_color(music_time_label_, lv_color_hex(0x9AA4AE), 0);
+        lv_obj_set_style_text_font(music_time_label_, &lv_font_montserrat_14, 0);
+        lv_label_set_text(music_time_label_, "0:00 / 0:00");
+
+        music_pause_label_ = lv_label_create(music_container_);
+        lv_obj_set_style_text_color(music_pause_label_, lv_color_hex(0xFFC857), 0);
+        lv_obj_set_style_text_font(music_pause_label_, text_font, 0);
+        lv_label_set_text(music_pause_label_, "暂停");
+        lv_obj_add_flag(music_pause_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (title != nullptr) {
+        lv_label_set_text(music_title_label_, title);
+    }
+    UpdateMusicLabels();
+
+    lv_obj_remove_flag(music_container_, LV_OBJ_FLAG_HIDDEN);
+    music_visible_ = true;
+    // 倒计时优先：它盖在音乐上面，屏幕只有 240x240，倒计时是更急的信息
+    if (countdown_visible_ && countdown_container_ != nullptr) {
+        lv_obj_move_foreground(countdown_container_);
+    } else {
+        lv_obj_move_foreground(music_container_);
+    }
+
+    if (music_timer_ == nullptr) {
+        esp_timer_create_args_t timer_args = {};
+        timer_args.callback = [](void* arg) {
+            static_cast<LvglDisplay*>(arg)->MusicTick();
+        };
+        timer_args.arg = this;
+        timer_args.name = "music_ui";
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &music_timer_));
+    }
+    esp_timer_stop(music_timer_);
+    music_tick_ = 0;
+    esp_timer_start_periodic(music_timer_, 250000);
+    ESP_LOGI(TAG, "Music UI: %s (dur=%d, pos=%d, paused=%d, mode=%s)",
+             title != nullptr ? title : "", music_duration_, music_position_, paused ? 1 : 0,
+             music_mode_text_.c_str());
+}
+
+void LvglDisplay::UpdateMusic(int position_seconds, int duration_seconds, bool paused) {
+    DisplayLockGuard lock(this);
+    music_position_ = position_seconds > 0 ? position_seconds : 0;
+    if (duration_seconds > 0) {
+        music_duration_ = duration_seconds;
+    }
+    music_paused_ = paused;
+    UpdateMusicLabels();
+}
+
+void LvglDisplay::HideMusic() {
+    if (music_timer_ != nullptr) {
+        esp_timer_stop(music_timer_);
+    }
+    music_visible_ = false;
+    music_paused_ = false;
+    music_tick_ = 0;
+    if (music_container_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    lv_obj_add_flag(music_container_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void LvglDisplay::MusicTick() {
+    if (!music_visible_) {
+        return;
+    }
+    music_tick_++;
+    DisplayLockGuard lock(this);
+    if (!music_paused_) {
+        for (int i = 0; i < 5; ++i) {
+            if (music_bars_[i] != nullptr) {
+                lv_obj_set_height(music_bars_[i], kMusicBarPattern[music_tick_ & 7][i]);
+            }
+        }
+    }
+    // 每秒推进一格。服务端会在开始/切歌/暂停/恢复时下发准确位置校准，
+    // 这里只是让屏幕别卡住不动。
+    if ((music_tick_ & 3) == 0 && !music_paused_ && music_duration_ > 0) {
+        if (music_position_ < music_duration_) {
+            music_position_++;
+        }
+        UpdateMusicLabels();
+    }
+}
+
 void LvglDisplay::SetPowerSaveMode(bool on) {
     if (on) {
         SetChatMessage("system", "");

@@ -14,13 +14,29 @@
 
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
 #define TAG "Application"
+
+// 发起打断后等设备端收到 tts stop 的最长时间。超过就自己把状态收回来，
+// 避免服务端那一轮已被取消（不再发 tts stop）时设备永远停在 speaking。
+static constexpr int64_t kAbortWatchdogMs = 2000;
+
+// 聆听静默多久自己回 idle（秒）。
+// 设备说完一句话后会停在 listening 等下一句，但固件里没有任何聆听超时，
+// 而省电计时器 PowerSaveCheck() 第一行就是「状态不是 idle 就把计数清零」——
+// 结果是只要说过一次话，60 秒暗屏和 600 秒关屏永远不会发生，麦克风也一直开着。
+// 回 idle 时故意不调 CloseAudioChannel()：WebSocket 保持，服务端仍能推 tts start，
+// 设备收到就切 speaking 并触发 PowerSaveTimer::WakeUp()，屏幕麦克风一起恢复。
+static constexpr int kListeningIdleTimeoutSeconds = 60;
+// 放歌时把背光压到这个亮度：省电、不刺眼，还能看清进度条
+static constexpr uint8_t kMusicScreenBrightness = 20;
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -64,6 +80,10 @@ Application::~Application() {
 bool Application::SetDeviceState(DeviceState state) { return state_machine_.TransitionTo(state); }
 
 void Application::Initialize() {
+    // 排查偶发重启：把本次复位原因打到串口。1=POWERON 3=SW 4=PANIC 5=INT_WDT
+    // 6=TASK_WDT 7=WDT 8=DEEPSLEEP 9=BROWNOUT 12=EXT_PIN
+    ESP_LOGI(TAG, "Reset reason: %d", static_cast<int>(esp_reset_reason()));
+
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
@@ -110,11 +130,6 @@ void Application::Initialize() {
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
-    // Registration is complete here, so this is the only place the whole inventory exists.
-    // It is logged because a server that accepts a bounded number of tools drops the rest
-    // quietly: the only sign on this device was an alert at boot and a sad face, which is
-    // easy to see and hard to connect to a tool list.
-    mcp_server.LogToolInventory();
 
     // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
@@ -267,6 +282,8 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
             if (GetDeviceState() == kDeviceStateListening) {
+                // 有人在说话，聆听静默计时重新开始
+                listening_idle_ticks_ = 0;
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
             }
@@ -283,6 +300,43 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            // 聆听静默超时：说完话没人再开口就自己回到 idle。只切状态、不关通道，
+            // 这样省电计时器开始跑（60 秒暗屏 / 600 秒关屏关麦），
+            // 而服务端仍然连着，随时能推 tts start 把设备叫醒。
+            if (GetDeviceState() == kDeviceStateListening) {
+                if (++listening_idle_ticks_ >= kListeningIdleTimeoutSeconds) {
+                    listening_idle_ticks_ = 0;
+                    ESP_LOGI(TAG, "Listening idle %d s, back to idle (audio channel kept)",
+                             kListeningIdleTimeoutSeconds);
+                    // 告诉服务端不用再等音频了，顺便让它把 VAD 里的残音清掉
+                    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                        protocol_->SendStopListening();
+                    }
+                    SetDeviceState(kDeviceStateIdle);
+                }
+            } else {
+                listening_idle_ticks_ = 0;
+            }
+            // 打断看门狗：AbortSpeaking 只是上报，真正的状态切换要等服务端 tts stop。
+            // 服务端那一轮被取消时不会再发 stop，设备就永远停在「说话中」——麦克风关着、
+            // 唤醒词也进不来，再按按键还是发 abort，形成死循环。这里超时自己收回来。
+            if (abort_pending_since_ != std::chrono::steady_clock::time_point{}) {
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - abort_pending_since_)
+                                      .count();
+                if (elapsed_ms >= kAbortWatchdogMs) {
+                    abort_pending_since_ = {};
+                    if (GetDeviceState() == kDeviceStateSpeaking) {
+                        ESP_LOGW(TAG, "Abort watchdog: no tts stop in %lld ms, leaving speaking",
+                                 static_cast<long long>(elapsed_ms));
+                        if (listening_mode_ == kListeningModeManualStop) {
+                            SetDeviceState(kDeviceStateIdle);
+                        } else {
+                            SetDeviceState(kDeviceStateListening);
+                        }
+                    }
+                }
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -454,14 +508,7 @@ void Application::CheckAssetsVersion() {
     // Apply assets
     assets.Apply();
     display->SetChatMessage("system", "");
-    // "robot_2" is declared only by a board shipping its own pack: esp-vocat maps it to
-    // neutral.eaf, and the rgb-matrix display special-cases the string. None of the shared
-    // esp_emote_assets packs (320_240, 360_360, 1024_600) declares it, so on every board that
-    // uses one this call fails, logs two errors and leaves whatever face was already up.
-    // Fall back to an emotion all three packs do declare.
-    if (!display->SetEmotion("robot_2")) {
-        display->SetEmotion("neutral");
-    }
+    display->SetEmotion("robot_2");
 }
 
 void Application::CheckNewVersion() {
@@ -649,10 +696,12 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    abort_pending_since_ = {};
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    abort_pending_since_ = {};
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -724,6 +773,72 @@ void Application::InitializeProtocol() {
                       Lang::Sounds::OGG_VIBRATION);
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
+            }
+        } else if (strcmp(type->valuestring, "ui") == 0) {
+            // 屏幕叠加层指令（倒计时）。只动显示，不碰音频链路：倒计时期间
+            // 唤醒词一直开着，喊一声照样能插话，秒数不受影响。
+            auto action = cJSON_GetObjectItem(root, "action");
+            if (!cJSON_IsString(action)) {
+                return;
+            }
+            if (strcmp(action->valuestring, "countdown") == 0) {
+                auto seconds = cJSON_GetObjectItem(root, "seconds");
+                auto text = cJSON_GetObjectItem(root, "text");
+                int secs = cJSON_IsNumber(seconds) ? seconds->valueint : 0;
+                std::string hint =
+                    cJSON_IsString(text) ? std::string(text->valuestring) : std::string();
+                ESP_LOGI(TAG, "Countdown UI: %d s", secs);
+                Schedule([display, secs, hint]() {
+                    display->ShowCountdown(secs, hint.c_str());
+                });
+            } else if (strcmp(action->valuestring, "countdown_hide") == 0) {
+                Schedule([display]() { display->HideCountdown(); });
+            } else if (strcmp(action->valuestring, "music_show") == 0) {
+                // 服务端在开始播放 / 切歌时下发完整信息，之后只用 music_update 校准进度
+                auto title = cJSON_GetObjectItem(root, "title");
+                auto artist = cJSON_GetObjectItem(root, "artist");
+                auto duration = cJSON_GetObjectItem(root, "duration");
+                auto position = cJSON_GetObjectItem(root, "position");
+                auto paused = cJSON_GetObjectItem(root, "paused");
+                auto mode = cJSON_GetObjectItem(root, "mode_text");
+                std::string title_str = cJSON_IsString(title) ? title->valuestring : "";
+                std::string artist_str = cJSON_IsString(artist) ? artist->valuestring : "";
+                std::string mode_str = cJSON_IsString(mode) ? mode->valuestring : "";
+                int duration_s = cJSON_IsNumber(duration) ? duration->valueint : 0;
+                int position_s = cJSON_IsNumber(position) ? position->valueint : 0;
+                bool paused_flag = cJSON_IsTrue(paused);
+                ESP_LOGI(TAG, "Music UI: %s - %s (%s)", title_str.c_str(), artist_str.c_str(),
+                         mode_str.c_str());
+                Schedule([display, title_str, artist_str, duration_s, position_s, paused_flag,
+                          mode_str]() {
+                    display->ShowMusic(title_str.c_str(), artist_str.c_str(), duration_s,
+                                       position_s, paused_flag, mode_str.c_str());
+                    auto backlight = Board::GetInstance().GetBacklight();
+                    if (backlight != nullptr) {
+                        backlight->SetBrightness(kMusicScreenBrightness);
+                    }
+                });
+            } else if (strcmp(action->valuestring, "music_update") == 0) {
+                auto duration = cJSON_GetObjectItem(root, "duration");
+                auto position = cJSON_GetObjectItem(root, "position");
+                auto paused = cJSON_GetObjectItem(root, "paused");
+                int duration_s = cJSON_IsNumber(duration) ? duration->valueint : 0;
+                int position_s = cJSON_IsNumber(position) ? position->valueint : 0;
+                bool paused_flag = cJSON_IsTrue(paused);
+                Schedule([display, duration_s, position_s, paused_flag]() {
+                    display->UpdateMusic(position_s, duration_s, paused_flag);
+                });
+            } else if (strcmp(action->valuestring, "music_hide") == 0) {
+                Schedule([display]() {
+                    display->HideMusic();
+                    auto backlight = Board::GetInstance().GetBacklight();
+                    if (backlight != nullptr) {
+                        // 读回用户设置的亮度（Settings 里的 display 项），不是硬编码
+                        backlight->RestoreBrightness();
+                    }
+                });
+            } else {
+                ESP_LOGW(TAG, "Unknown ui action: %s", action->valuestring);
             }
 #if CONFIG_RECEIVE_CUSTOM_MESSAGE
         } else if (strcmp(type->valuestring, "custom") == 0) {
@@ -838,9 +953,17 @@ void Application::HandleToggleChatEvent() {
         }
         SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
+        // 放歌或播报时按一下：先停下来，再直接进聆听。只停不进聆听的话孩子得按两下，
+        // 而按第二下时设备已经回 idle，等于要重新叫一次。唤醒词那条路也是这个顺序
+        // （AbortSpeaking -> SetListeningMode），这里保持一致。
         AbortSpeaking(kAbortReasonNone);
+        play_popup_on_listening_ = true;
+        SetListeningMode(GetDefaultListeningMode());
     } else if (state == kDeviceStateListening) {
         protocol_->CloseAudioChannel();
+        // CloseAudioChannel 只是 reset websocket_，状态要靠 OnAudioChannelClosed 回调收回。
+        // 通道本来就是断的时候回调不会再触发，状态会卡在 listening（同状态转换是 no-op，安全）。
+        SetDeviceState(kDeviceStateIdle);
     }
 }
 
@@ -1043,6 +1166,15 @@ void Application::HandleStateChangedEvent() {
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+            // 兜底：音乐界面还挂着就收掉（正常是服务端下发 music_hide，但会话断了、
+            // 或者服务端那条消息丢了也不能让屏幕永远停在 20% 亮度的歌名上）。
+            if (auto music_display = board.GetDisplay();
+                music_display != nullptr && music_display->IsMusicVisible()) {
+                music_display->HideMusic();
+                if (auto backlight = board.GetBacklight(); backlight != nullptr) {
+                    backlight->RestoreBrightness();
+                }
+            }
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1268,6 +1400,9 @@ void Application::Schedule(std::function<void()>&& callback) {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    // 设备离开 speaking 状态只能靠服务端回 tts stop，而那一轮可能已经被服务端
+    // 取消（不再发）。记下时刻，CLOCK_TICK 里做看门狗兜底。
+    abort_pending_since_ = std::chrono::steady_clock::now();
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
@@ -1395,11 +1530,24 @@ bool Application::CanEnterSleepMode() {
         return false;
     }
 
-    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+    // 这里不再要求音频通道已关闭。WebSocket 是长连接，说过一次话之后就一直是开着的，
+    // 把它当成「不能睡」的条件，设备就再也进不了省电模式。
+    // light sleep 下 WiFi 保持连接、TCP 不断，服务端仍能随时推送，收到数据会自动唤醒 CPU。
+
+    if (!audio_service_.IsIdle()) {
         return false;
     }
 
-    if (!audio_service_.IsIdle()) {
+    // 倒计时显示期间不省电：一级会把背光压到 1%（数字就看不见了），二级还要
+    // 关掉唤醒词并进 light sleep（孩子喊不醒、也没法中途插话）。倒计时一般也就
+    // 几分钟到半小时，这点电换「看得见、叫得醒」是值的。
+    auto countdown_display = Board::GetInstance().GetDisplay();
+    if (countdown_display != nullptr && countdown_display->IsCountdownVisible()) {
+        return false;
+    }
+    // 放歌时同样别省电：一级会把背光压到 1%（进度条就看不见了），二级要关唤醒词，
+    // 而放歌时唤醒词是唯一能打断的入口。
+    if (countdown_display != nullptr && countdown_display->IsMusicVisible()) {
         return false;
     }
 

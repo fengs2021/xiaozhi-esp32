@@ -53,13 +53,60 @@ Ota::Ota() {
 Ota::~Ota() {
 }
 
-std::string Ota::GetCheckVersionUrl() {
-    Settings settings("wifi", false);
-    std::string url = settings.GetString("ota_url");
-    if (url.empty()) {
-        url = CONFIG_OTA_URL;
+// 把一段文本按分隔符（逗号、分号、竖线、空白、换行）拆成多个 OTA 地址。
+static void SplitOtaUrls(const std::string& text, std::vector<std::string>& out) {
+    std::string current;
+    for (char ch : text) {
+        bool is_sep = (ch == ',' || ch == ';' || ch == '|' || ch == ' ' || ch == '\t' ||
+                       ch == '\r' || ch == '\n');
+        if (is_sep) {
+            if (!current.empty()) {
+                out.push_back(current);
+                current.clear();
+            }
+        } else {
+            current.push_back(ch);
+        }
     }
-    return url;
+    if (!current.empty()) {
+        out.push_back(current);
+    }
+}
+
+std::vector<std::string> Ota::GetCheckVersionUrlCandidates() {
+    std::vector<std::string> candidates;
+    Settings settings("wifi", false);
+
+    // ① 用户在配网页面填写的地址，可一次填多个（主地址写最前）
+    SplitOtaUrls(settings.GetString("ota_url"), candidates);
+    // ② 预留的备用地址键，便于以后用其他方式写入
+    SplitOtaUrls(settings.GetString("ota_url_backup"), candidates);
+    // ③ 编译期默认地址
+    SplitOtaUrls(CONFIG_OTA_URL, candidates);
+#ifdef CONFIG_OTA_URL_FALLBACK
+    // ④ 编译期备用地址
+    SplitOtaUrls(CONFIG_OTA_URL_FALLBACK, candidates);
+#endif
+
+    // 去重，保持优先级顺序
+    std::vector<std::string> result;
+    for (auto& url : candidates) {
+        if (url.length() < 10) {
+            continue;
+        }
+        if (std::find(result.begin(), result.end(), url) == result.end()) {
+            result.push_back(url);
+        }
+    }
+    return result;
+}
+
+std::string Ota::GetCheckVersionUrl() {
+    auto candidates = GetCheckVersionUrlCandidates();
+    if (candidates.empty()) {
+        return std::string();
+    }
+    return candidates.front();
 }
 
 std::unique_ptr<Http> Ota::SetupHttp() {
@@ -84,21 +131,17 @@ std::unique_ptr<Http> Ota::SetupHttp() {
 /* 
  * Specification: https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd
  */
-NetworkResult<> Ota::CheckVersion() {
+NetworkResult<> Ota::CheckVersionOnce(const std::string& url) {
     auto& board = Board::GetInstance();
-    auto app_desc = esp_app_get_description();
 
-    // Check if there is a new firmware version available
-    current_version_ = app_desc->version;
-    ESP_LOGI(TAG, "Current version: %s", current_version_.c_str());
-
-    std::string url = GetCheckVersionUrl();
     if (url.length() < 10) {
         ESP_LOGE(TAG, "Check version URL is not properly set");
         return std::unexpected(NetworkError::InvalidArgument());
     }
 
     auto http = SetupHttp();
+    // 多地址回落时每个地址都不宜等太久，缩短单次 HTTP 超时
+    http->SetTimeout(8000);
 
     std::string data = board.GetSystemInfoJson();
     std::string method = data.length() > 0 ? "POST" : "GET";
@@ -255,6 +298,38 @@ NetworkResult<> Ota::CheckVersion() {
 
     cJSON_Delete(root);
     return {};
+}
+
+NetworkResult<> Ota::CheckVersion() {
+    auto app_desc = esp_app_get_description();
+    current_version_ = app_desc->version;
+    ESP_LOGI(TAG, "Current version: %s", current_version_.c_str());
+
+    auto candidates = GetCheckVersionUrlCandidates();
+    if (candidates.empty()) {
+        ESP_LOGE(TAG, "Check version URL is not properly set");
+        return std::unexpected(NetworkError::InvalidArgument());
+    }
+
+    NetworkError last_error = NetworkError::Unknown();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const std::string& url = candidates[i];
+        if (i > 0) {
+            ESP_LOGW(TAG, "Falling back to OTA URL #%u: %s", (unsigned)(i + 1), url.c_str());
+        } else {
+            ESP_LOGI(TAG, "Using OTA URL: %s", url.c_str());
+        }
+        auto result = CheckVersionOnce(url);
+        if (result) {
+            active_ota_url_ = url;
+            return {};
+        }
+        last_error = result.error();
+        ESP_LOGW(TAG, "OTA URL #%u failed: %s", (unsigned)(i + 1), last_error.ToString().c_str());
+    }
+
+    ESP_LOGE(TAG, "All %u OTA URLs failed", (unsigned)candidates.size());
+    return std::unexpected(last_error);
 }
 
 void Ota::MarkCurrentVersionValid() {
@@ -507,7 +582,11 @@ esp_err_t Ota::Activate() {
         return ESP_FAIL;
     }
 
-    std::string url = GetCheckVersionUrl();
+    std::string url = active_ota_url_.empty() ? GetCheckVersionUrl() : active_ota_url_;
+    if (url.empty()) {
+        ESP_LOGE(TAG, "Check version URL is not properly set");
+        return ESP_FAIL;
+    }
     if (url.back() != '/') {
         url += "/activate";
     } else {

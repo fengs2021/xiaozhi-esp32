@@ -1,5 +1,4 @@
 {
-    "manufacturer": "quandong",
     "type": "quandong-s3-dev",
     "target": "esp32s3",
     "builds": [
