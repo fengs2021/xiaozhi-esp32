@@ -58,6 +58,37 @@ Led* Board::GetLed() {
     return &led;
 }
 
+const char* Board::ResetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:    return "power-on";
+        case ESP_RST_EXT:        return "external pin";
+        case ESP_RST_SW:         return "software restart";
+        case ESP_RST_PANIC:      return "panic or exception";
+        case ESP_RST_INT_WDT:    return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:   return "task watchdog";
+        case ESP_RST_WDT:        return "other watchdog";
+        case ESP_RST_DEEPSLEEP:  return "deep sleep wake";
+        case ESP_RST_BROWNOUT:   return "brownout";
+        case ESP_RST_SDIO:       return "SDIO";
+        case ESP_RST_USB:        return "USB peripheral";
+        case ESP_RST_JTAG:       return "JTAG";
+        case ESP_RST_EFUSE:      return "efuse error";
+        case ESP_RST_PWR_GLITCH: return "power glitch";
+        case ESP_RST_CPU_LOCKUP: return "CPU lockup";
+        case ESP_RST_UNKNOWN:    return "undetermined";
+    }
+    return "unrecognised";
+}
+
+// 这次是怎么起来的。esp_reset_reason() 整个启动周期里保持不变，所以什么时候问都一样。
+// 串口日志在 app_main 顶部就打了，而复位会重新枚举 USB 串口，录制方往往从那一行之后才接上；
+// 于是「莫名重启」和「拔插了线」在日志里长得一样，panic 没来得及打印则像按了按键。
+void Board::AddSystemStatus(cJSON* root) {
+    auto system = cJSON_CreateObject();
+    cJSON_AddStringToObject(system, "reset_reason", ResetReasonName(esp_reset_reason()));
+    cJSON_AddItemToObject(root, "system", system);
+}
+
 std::string Board::GetSystemInfoJson() {
     /*
         {

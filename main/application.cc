@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cmath>
 #include <limits>
 
 #define TAG "Application"
@@ -130,6 +131,9 @@ void Application::Initialize() {
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
+    // 注册到此结束，整个清单只有这里有全貌。之所以要打日志：服务端能收的工具数有上限，
+    // 多出来的会被静默丢弃，设备上只表现为开机一句 alert 加一个难过表情，很难和工具列表联系起来。
+    mcp_server.LogToolInventory();
 
     // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
@@ -343,6 +347,7 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+                audio_service_.LogInputWatch();
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
@@ -839,6 +844,20 @@ void Application::InitializeProtocol() {
                 });
             } else {
                 ESP_LOGW(TAG, "Unknown ui action: %s", action->valuestring);
+            }
+        } else if (strcmp(type->valuestring, "cfg") == 0) {
+            // 维护用旋钮：调唤醒词阈值。上行由服务端/探针发
+            // {"type":"cfg","action":"wake_threshold","value":0.5}，0 恢复模型自带默认
+            // （wn9_xiaoaitongxue 编译期值 0.620）。只改 AFE 的判别门槛，不碰音频链路。
+            auto action = cJSON_GetObjectItem(root, "action");
+            if (cJSON_IsString(action) && strcmp(action->valuestring, "wake_threshold") == 0) {
+                auto value = cJSON_GetObjectItem(root, "value");
+                if (cJSON_IsNumber(value) && std::isfinite(value->valuedouble)) {
+                    const float thr = (float)value->valuedouble;
+                    const bool ok = audio_service_.SetWakeWordThreshold(thr);
+                    ESP_LOGI(TAG, "Wake word threshold -> %.4f: %s (now %.4f)", thr,
+                             ok ? "ok" : "rejected", audio_service_.GetWakeWordThreshold());
+                }
             }
 #if CONFIG_RECEIVE_CUSTOM_MESSAGE
         } else if (strcmp(type->valuestring, "custom") == 0) {

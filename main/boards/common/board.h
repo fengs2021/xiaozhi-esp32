@@ -8,6 +8,8 @@
 #include <string>
 #include <functional>
 #include <network_interface.h>
+#include <esp_system.h>
+#include <cJSON.h>
 
 #include "led/led.h"
 #include "backlight.h"
@@ -55,6 +57,9 @@ protected:
     Board();
     std::string GenerateUuid();
 
+    // GetDeviceStatusJson 里的 system 块，放在基类以免依赖各板子用哪套网络栈
+    void AddSystemStatus(cJSON* root);
+
     // 软件生成的设备唯一标识
     std::string uuid_;
 
@@ -79,6 +84,8 @@ public:
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
     virtual std::string GetSystemInfoJson();
+    // 复位原因枚举的唯一字符串化点，板子自己想打日志也复用它
+    static const char* ResetReasonName(esp_reset_reason_t reason);
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;

@@ -39,11 +39,14 @@ void McpServer::AddCommonTools() {
 
     AddTool("self.get_device_status",
             "Provides the real-time information of the device, including the current status of the "
-            "audio speaker, screen, battery, network, etc.\n"
+            "audio speaker, screen, battery, network, and why the device last restarted.\n"
             "Use this tool for: \n"
             "1. Answering questions about current condition (e.g. what is the current volume of "
             "the audio speaker?)\n"
-            "2. As the first step to control the device (e.g. turn up / down the volume of the "
+            "2. Answering why the device rebooted or restarted - whether it was powered on, "
+            "reset by its button, or crashed. This is about the device, not about the "
+            "conversation.\n"
+            "3. As the first step to control the device (e.g. turn up / down the volume of the "
             "audio speaker, etc.)",
             PropertyList(), [&board](const PropertyList& properties) -> ReturnValue {
                 return board.GetDeviceStatusJson();
@@ -324,6 +327,17 @@ void McpServer::AddUserOnlyTools() {
                         settings.SetString("download_url", url);
                         return true;
                     });
+}
+
+void McpServer::LogToolInventory() const {
+    size_t user_only = 0;
+    for (const auto& tool : tools_) {
+        if (tool->user_only()) {
+            ++user_only;
+        }
+    }
+    ESP_LOGI(TAG, "%u tools registered: %u visible to the model, %u user-only",
+             (unsigned)tools_.size(), (unsigned)(tools_.size() - user_only), (unsigned)user_only);
 }
 
 void McpServer::AddTool(std::unique_ptr<McpTool> tool) {

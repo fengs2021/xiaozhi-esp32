@@ -1,5 +1,6 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <cmath>
 #include <cstring>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
@@ -192,6 +193,27 @@ void AudioService::Stop() {
     }
 }
 
+void AudioService::ApplyDcBlock(std::vector<int16_t>& data, int channels) {
+    if (channels < 1) {
+        return;
+    }
+    if (channels > 2) {
+        channels = 2;
+    }
+    const size_t stride = static_cast<size_t>(channels);
+    for (size_t i = 0; i + stride <= data.size(); i += stride) {
+        for (int ch = 0; ch < channels; ++ch) {
+            const float x = static_cast<float>(data[i + ch]);
+            const float y = x - dc_block_prev_in_[ch] + kDcBlockPole * dc_block_prev_out_[ch];
+            dc_block_prev_in_[ch] = x;
+            dc_block_prev_out_[ch] = y;
+            const float clamped =
+                y > 32767.0f ? 32767.0f : (y < -32768.0f ? -32768.0f : y);
+            data[i + ch] = static_cast<int16_t>(clamped);
+        }
+    }
+}
+
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);
@@ -223,6 +245,32 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
             return false;
         }
     }
+
+    // Raw extremes, taken before the blocker runs. A bias makes them lopsided - one rail is
+    // reached early, the other never - while a genuinely loud signal is symmetric. This is the
+    // one measurement that tells those two apart without a scope.
+    {
+        const int channels_now = codec_->input_channels() > 0 ? codec_->input_channels() : 1;
+        int32_t lo = raw_min_.load(std::memory_order_relaxed);
+        int32_t hi = raw_max_.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < data.size(); i += channels_now) {
+            const int32_t sample = data[i];
+            if (sample < lo) {
+                lo = sample;
+            }
+            if (sample > hi) {
+                hi = sample;
+            }
+        }
+        raw_min_.store(lo, std::memory_order_relaxed);
+        raw_max_.store(hi, std::memory_order_relaxed);
+    }
+
+    // Strip the DC offset before anyone downstream sees it: the ADC bias rides on every sample,
+    // the AFE and the Opus encoder both inherit it, and the clipping it causes happens right here
+    // at the rail - no later stage can undo it. Running the level meter after this point means the
+    // ten-second log reports what the engine actually receives.
+    ApplyDcBlock(data, codec_->input_channels());
 
     /* Update the last input time */
     last_input_time_ = std::chrono::steady_clock::now();
@@ -311,6 +359,7 @@ void AudioService::AudioInputTask() {
             int samples = 160;  // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
+                AccumulateInputLevel(data);
                 audio_engine_->Feed(std::move(data));
                 continue;
             }
@@ -881,5 +930,127 @@ bool AudioService::InitializeAudioEngine() {
     }
     audio_engine_initialized_ = true;
     audio_engine_->EnableDeviceAec(device_aec_enabled_);
+    if (wake_word_threshold_ != 0.0f) {
+        audio_engine_->SetWakeWordThreshold(wake_word_threshold_);
+    }
     return true;
+}
+
+bool AudioService::SetWakeWordThreshold(float threshold) {
+    if (threshold != 0.0f && (threshold < 0.4f || threshold > 0.9999f)) {
+        return false;
+    }
+    // Stored whether or not an engine exists yet, so a value set during board initialisation
+    // is still applied once InitializeAudioEngine runs.
+    wake_word_threshold_ = threshold;
+    if (!audio_engine_) {
+        return true;
+    }
+    return audio_engine_->SetWakeWordThreshold(threshold);
+}
+
+void AudioService::AccumulateInputLevel(const std::vector<int16_t>& data) {
+    if (data.empty()) {
+        return;
+    }
+    // With a reference channel the frames are interleaved mic/reference, and the reference is
+    // the speaker's own signal: measuring it would report what the robot said, not what it heard.
+    const size_t stride = codec_ != nullptr && codec_->input_channels() == 2 ? 2 : 1;
+    int32_t peak = 0;
+    int64_t sum_squares = 0;
+    int64_t sum_samples = 0;
+    size_t counted = 0;
+    for (size_t i = 0; i < data.size(); i += stride) {
+        const int32_t sample = data[i];
+        const int32_t magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > peak) {
+            peak = magnitude;
+        }
+        sum_squares += static_cast<int64_t>(sample) * sample;
+        sum_samples += sample;
+        ++counted;
+    }
+    if (counted == 0) {
+        return;
+    }
+    const int32_t rms = static_cast<int32_t>(
+        std::sqrt(static_cast<double>(sum_squares / static_cast<int64_t>(counted))));
+    // The frame mean, kept only for the loudest frame. Peak and RMS alone cannot tell "the room
+    // really is this loud" from "the ADC sits on a DC bias": both push RMS up, and a bias also
+    // eats the headroom until the waveform clips. This one number separates the two.
+    const int32_t dc = static_cast<int32_t>(sum_samples / static_cast<int64_t>(counted));
+
+    if (input_level_frames_.fetch_add(1, std::memory_order_relaxed) == 0) {
+        input_level_window_start_ms_.store(esp_timer_get_time() / 1000, std::memory_order_relaxed);
+    }
+    if (peak > input_level_peak_.load(std::memory_order_relaxed)) {
+        input_level_peak_.store(peak, std::memory_order_relaxed);
+    }
+    if (rms > input_level_peak_rms_.load(std::memory_order_relaxed)) {
+        input_level_peak_rms_.store(rms, std::memory_order_relaxed);
+        input_level_peak_dc_.store(dc, std::memory_order_relaxed);
+    }
+}
+
+AudioService::InputLevel AudioService::TakeInputLevel() {
+    InputLevel level;
+    level.frames = input_level_frames_.exchange(0, std::memory_order_relaxed);
+    level.peak = input_level_peak_.exchange(0, std::memory_order_relaxed);
+    const int32_t rms = input_level_peak_rms_.exchange(0, std::memory_order_relaxed);
+    level.loudest_frame_rms = rms;
+    level.loudest_frame_dc = input_level_peak_dc_.exchange(0, std::memory_order_relaxed);
+    level.raw_min = raw_min_.exchange(0, std::memory_order_relaxed);
+    level.raw_max = raw_max_.exchange(0, std::memory_order_relaxed);
+    const int64_t started = input_level_window_start_ms_.load(std::memory_order_relaxed);
+    if (level.frames > 0 && started > 0) {
+        level.window_ms = static_cast<uint32_t>((esp_timer_get_time() / 1000) - started);
+    }
+    // Full scale is 32768 for a signed 16-bit sample, so 0 dBFS is a sample that just clips.
+    // A window with no signal at all reports the floor instead of negative infinity.
+    if (level.peak > 0) {
+        level.peak_dbfs = 20.0f * std::log10(static_cast<float>(level.peak) / 32768.0f);
+    }
+    if (rms > 0) {
+        level.loudest_frame_rms_dbfs = 20.0f * std::log10(static_cast<float>(rms) / 32768.0f);
+    }
+    {
+        std::lock_guard<std::mutex> lock(input_level_mutex_);
+        last_input_level_ = level;
+        last_input_level_closed_ms_ = esp_timer_get_time() / 1000;
+    }
+    return level;
+}
+
+AudioService::InputLevel AudioService::LastInputLevel() const {
+    std::lock_guard<std::mutex> lock(input_level_mutex_);
+    InputLevel level = last_input_level_;
+    if (last_input_level_closed_ms_ > 0) {
+        level.age_ms =
+            static_cast<uint32_t>((esp_timer_get_time() / 1000) - last_input_level_closed_ms_);
+    }
+    return level;
+}
+
+void AudioService::LogInputWatch() {
+    const InputLevel level = TakeInputLevel();
+    // frames counts what was handed to the engine, which is upstream of its processing side: a
+    // full thousand frames says the feed is healthy, not that anything came out the other end.
+    // fetches and drops say that, and the pair is why this line can take the second fork in the
+    // diagnosis - measured on u21, frames=1000 with a signal twenty times the noise floor while
+    // the wake word never fired, which ruled the feed side out and left only this.
+    //
+    // Log-only, not in the status block: they are read-and-cleared and the ten-second line owns
+    // that clock. A second consumer would starve it, which is the mistake u21 fixed.
+    const uint32_t fetches = audio_engine_ ? audio_engine_->TakeFetchCount() : 0;
+    const uint32_t drops = audio_engine_ ? audio_engine_->TakeFetchDropCount() : 0;
+    // Raw sample magnitudes, not dB: an integer cannot be misread, and 0 means silence rather
+    // than a floor value someone has to recognise.
+    ESP_LOGI(TAG,
+             "input: wake_word=%d processor=%d frames=%u fetches=%u drops=%u peak=%d rms=%d "
+             "dc=%d raw[min=%d max=%d] win=%ums thr=%.4f%s",
+             IsWakeWordRunning() ? 1 : 0, IsAudioProcessorRunning() ? 1 : 0,
+             (unsigned)level.frames, (unsigned)fetches, (unsigned)drops, (int)level.peak,
+             (int)level.loudest_frame_rms, (int)level.loudest_frame_dc, (int)level.raw_min,
+             (int)level.raw_max, (unsigned)level.window_ms, (double)GetWakeWordThreshold(),
+             GetWakeWordThreshold() > 0.0f ? "" : "(default)");
 }

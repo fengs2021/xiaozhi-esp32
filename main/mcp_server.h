@@ -430,6 +430,9 @@ public:
 
     void AddCommonTools();
     void AddUserOnlyTools();
+    // 注册全部完成后打一次清单。只说数量：能收多少是服务端的策略，固件不该硬编码一个数，
+    // 而数量已经够用——谁加了工具，就能看到总数变成了多少。
+    void LogToolInventory() const;
     void AddTool(std::unique_ptr<McpTool> tool);
     void AddTool(const std::string& name, const std::string& description,
                  const PropertyList& properties, ToolCallback callback);

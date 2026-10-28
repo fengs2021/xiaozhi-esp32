@@ -359,6 +359,23 @@ std::string WifiBoard::GetDeviceStatusJson() {
         cJSON_AddItemToObject(root, "chip", chip);
     }
 
+    // 麦克风电平：与 10 秒一次的 input: 日志同源，但走 LastInputLevel()，不去取走日志的窗口。
+    // 插着 USB 时设备不省电（也就没有省电相关日志）、拔掉又抓不到串口，这条是那个死结的出口：
+    // 通过 self.get_device_status 远程就能看出「麦克风有没有在喂数据」。
+    {
+        auto& audio = Application::GetInstance().GetAudioService();
+        auto level = audio.LastInputLevel();
+        auto audio_status = cJSON_CreateObject();
+        cJSON_AddNumberToObject(audio_status, "wake_threshold", audio.GetWakeWordThreshold());
+        cJSON_AddNumberToObject(audio_status, "mic_frames", level.frames);
+        cJSON_AddNumberToObject(audio_status, "mic_peak", level.peak);
+        cJSON_AddNumberToObject(audio_status, "mic_rms", level.loudest_frame_rms);
+        cJSON_AddNumberToObject(audio_status, "mic_dc", level.loudest_frame_dc);
+        cJSON_AddNumberToObject(audio_status, "mic_age_ms", level.age_ms);
+        cJSON_AddItemToObject(root, "audio", audio_status);
+    }
+    AddSystemStatus(root);
+
     auto str = cJSON_PrintUnformatted(root);
     std::string result(str);
     cJSON_free(str);
