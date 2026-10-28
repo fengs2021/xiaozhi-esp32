@@ -3,6 +3,7 @@
 
 #include <esp_log.h>
 #include <driver/ledc.h>
+#include <ctime>
 
 #define TAG "Backlight"
 
@@ -20,12 +21,36 @@ Backlight::Backlight() {
         .skip_unhandled_events = true,
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &transition_timer_));
+
+    // 夜间模式检查：每分钟看一眼时间，跨进/跨出夜间时段就立刻调亮度。
+    // 这里只碰 LEDC 亮度，不碰 LVGL，所以可以直接在 esp_timer 任务里跑。
+    const esp_timer_create_args_t night_args = {
+        .callback = [](void* arg) {
+            auto self = static_cast<Backlight*>(arg);
+            self->OnNightTick();
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "backlight_night",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&night_args, &night_timer_));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(night_timer_, 60 * 1000 * 1000));
+    // 开机时先把状态对齐，这样夜里上电也不会先亮一下再变暗
+    night_active_ = IsNightTime();
+    if (night_active_) {
+        ESP_LOGI(TAG, "开机即处于夜间模式，亮度上限 %d%%", kNightModeMaxBrightness);
+    }
 }
 
 Backlight::~Backlight() {
     if (transition_timer_ != nullptr) {
         esp_timer_stop(transition_timer_);
         esp_timer_delete(transition_timer_);
+    }
+    if (night_timer_ != nullptr) {
+        esp_timer_stop(night_timer_);
+        esp_timer_delete(night_timer_);
     }
 }
 
@@ -43,9 +68,63 @@ void Backlight::RestoreBrightness() {
     SetBrightness(saved_brightness);
 }
 
+bool Backlight::IsNightTime() {
+    time_t now = time(nullptr);
+    struct tm tm_now;
+    gmtime_r(&now, &tm_now);
+    // 时间还没同步（OTA 的 server_time 没到）就别瞎判，当成白天
+    if (tm_now.tm_year + 1900 < 2025) {
+        return false;
+    }
+    int cur = tm_now.tm_hour * 60 + tm_now.tm_min;
+    if (kNightModeStartMinute == kNightModeEndMinute) {
+        return false;
+    }
+    if (kNightModeStartMinute < kNightModeEndMinute) {
+        return cur >= kNightModeStartMinute && cur < kNightModeEndMinute;
+    }
+    // 跨零点，比如 22:00 -> 07:00
+    return cur >= kNightModeStartMinute || cur < kNightModeEndMinute;
+}
+
+void Backlight::OnNightTick() {
+    bool active = IsNightTime();
+    if (active == night_active_) {
+        return;
+    }
+    night_active_ = active;
+    if (active) {
+        // 记下现在本来该多亮，天亮后恢复；已经关屏（0）就不用管
+        if (target_brightness_ > kNightModeMaxBrightness) {
+            night_restore_brightness_ = target_brightness_;
+        }
+        ESP_LOGI(TAG, "进入夜间模式，亮度压到 %d%%（原本 %d%%）",
+                 kNightModeMaxBrightness, target_brightness_);
+        if (brightness_ > kNightModeMaxBrightness) {
+            SetBrightness(kNightModeMaxBrightness);
+        }
+    } else {
+        uint8_t restore = night_restore_brightness_ > kNightModeMaxBrightness
+                              ? night_restore_brightness_
+                              : 75;
+        ESP_LOGI(TAG, "退出夜间模式，恢复亮度 %d%%", restore);
+        if (brightness_ > 0) {
+            SetBrightness(restore);
+        }
+    }
+}
+
 void Backlight::SetBrightness(uint8_t brightness, bool permanent) {
     if (brightness > 100) {
         brightness = 100;
+    }
+
+    // 夜间模式：无论谁来要亮度（省电定时器唤醒、RestoreBrightness、服务端 MCP 下发），
+    // 一律压到上限。0（关屏）保持 0，不会被"抬亮"。
+    uint8_t wanted = brightness;
+    if (night_active_ && brightness > kNightModeMaxBrightness) {
+        night_restore_brightness_ = brightness;
+        brightness = kNightModeMaxBrightness;
     }
 
     if (brightness_ == brightness) {
@@ -54,7 +133,9 @@ void Backlight::SetBrightness(uint8_t brightness, bool permanent) {
 
     if (permanent) {
         Settings settings("display", true);
-        settings.SetInt("brightness", brightness);
+        // 存调用方真正想要的那个值，不然夜里把亮度调到 1% 会被写进 NVS，
+        // 白天开机也只剩 1%
+        settings.SetInt("brightness", wanted);
     }
 
     target_brightness_ = brightness;
