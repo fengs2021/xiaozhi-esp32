@@ -244,6 +244,20 @@ def process_sr_models(wakenet_model_dirs, multinet_model_dirs, build_dir, assets
                 models_processed += 1
                 print(f"Added multinet model: {multinet_name}")
     
+    # nsnet2 降噪模型：CONFIG_SR_NSN_NSNET2=y 时也要打进 srmodels.bin，
+    # 否则固件里 esp_srmodel_filter(ESP_NSNET_PREFIX) 拿不到模型，
+    # 串口只会打「没有可用的 nsnet 模型，噪声抑制保持关闭」。
+    nsnet_root = Path(__file__).resolve().parents[1] / "managed_components" / "espressif__esp-sr" / "model" / "nsnet_model"
+    if nsnet_root.is_dir():
+        for name in ("nsnet2", "nsnet1"):
+            src_dir = nsnet_root / name
+            if not src_dir.is_dir():
+                continue
+            if copy_directory(str(src_dir), os.path.join(sr_models_build_dir, name)):
+                models_processed += 1
+                print(f"Added ns model: {name}")
+            break
+
     if models_processed == 0:
         print("Warning: No SR models were successfully processed")
         return None
