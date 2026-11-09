@@ -6,7 +6,7 @@
     {
       "name": "xingzhi-cube-1.54tft-wifi",
       "sdkconfig_append": [
-        "CONFIG_PM_ENABLE=y",
+        "CONFIG_PM_ENABLE=y", "CONFIG_SR_NSN_NSNET2=y",
         "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y",
         "CONFIG_PM_SLP_IRAM_OPT=y",
         "CONFIG_ESP_WIFI_SLP_IRAM_OPT=y",

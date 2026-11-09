@@ -133,7 +133,21 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     afe_config->aec_init = codec_->input_reference();
     afe_config->aec_mode = AEC_MODE_FD_LOW_COST;
     afe_config->aec_nlp_level = AEC_NLP_LEVEL_VERYAGGR;
-    afe_config->ns_init = false;
+    // 收音优化：这台是单麦远场（孩子隔一两米说话），原来 ns_init=false 等于完全不降噪，
+    // 空调/电视/玩具的声音会原样进 ASR。打开 nsnet2 噪声抑制 + 自动增益，
+    // 模型在分区里由 CONFIG_SR_NSN_NSNET2=y 编入。
+    char* ns_model_name =
+        models_ == nullptr ? nullptr : esp_srmodel_filter(models_, ESP_NSNET_PREFIX, nullptr);
+    afe_config->ns_init = ns_model_name != nullptr;
+    if (ns_model_name != nullptr) {
+      afe_config->ns_model_name = ns_model_name;
+      ESP_LOGI(TAG, "AFE 噪声抑制已启用: %s", ns_model_name);
+    } else {
+      ESP_LOGW(TAG, "没有可用的 nsnet 模型，噪声抑制保持关闭");
+    }
+    afe_config->agc_init = true;
+    afe_config->agc_compression_gain_db = 10;
+    afe_config->agc_target_level_dbfs = 6;
     afe_config->vad_init = kUseAfeForVoiceProcessing;
     afe_config->vad_mode = VAD_MODE_0;
     afe_config->vad_min_noise_ms = 100;
