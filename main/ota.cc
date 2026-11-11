@@ -91,7 +91,9 @@ std::vector<std::string> Ota::GetCheckVersionUrlCandidates() {
     // 去重，保持优先级顺序
     std::vector<std::string> result;
     for (auto& url : candidates) {
-        if (url.length() < 10) {
+        // 只认 http(s) 开头的地址：配网页面里手滑写进中文/空串时，
+        // 以前会拿这个垃圾串去连（日志里 Check version URL is not properly set 就是这样来的）
+        if (url.length() < 10 || (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)) {
             continue;
         }
         if (std::find(result.begin(), result.end(), url) == result.end()) {
